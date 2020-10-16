@@ -1,11 +1,17 @@
 package com.github.gcacace.signaturepad.utils;
 
-public class SvgBuilder {
+import android.os.Parcel;
+import android.os.Parcelable;
+
+public class SvgBuilder implements Parcelable {
 
     private final StringBuilder mSvgPathsBuilder = new StringBuilder();
     private SvgPathBuilder mCurrentPathBuilder = null;
 
-    public SvgBuilder() {
+    public SvgBuilder() { }
+
+    protected SvgBuilder(Parcel in) {
+        mSvgPathsBuilder.append(in.readString());
     }
 
     public void clear() {
@@ -80,4 +86,26 @@ public class SvgBuilder {
         return mCurrentPathBuilder != null;
     }
 
+
+    public static final Creator<SvgBuilder> CREATOR = new Creator<SvgBuilder>() {
+        @Override
+        public SvgBuilder createFromParcel(Parcel in) {
+            return new SvgBuilder(in);
+        }
+
+        @Override
+        public SvgBuilder[] newArray(int size) {
+            return new SvgBuilder[size];
+        }
+    };
+
+    @Override
+    public int describeContents() {
+        return 0;
+    }
+
+    @Override
+    public void writeToParcel(Parcel dest, int flags) {
+        dest.writeString(mSvgPathsBuilder.toString());
+    }
 }

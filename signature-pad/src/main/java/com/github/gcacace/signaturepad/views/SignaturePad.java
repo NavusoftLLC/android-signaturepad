@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.res.Resources;
 import android.content.res.TypedArray;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Matrix;
@@ -12,6 +13,7 @@ import android.graphics.RectF;
 import android.os.Bundle;
 import android.os.Parcelable;
 import android.util.AttributeSet;
+import android.util.Log;
 import android.view.GestureDetector;
 import android.view.MotionEvent;
 import android.view.View;
@@ -25,10 +27,22 @@ import com.github.gcacace.signaturepad.utils.TimedPoint;
 import com.github.gcacace.signaturepad.view.ViewCompat;
 import com.github.gcacace.signaturepad.view.ViewTreeObserverCompat;
 
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Executors;
 
 public class SignaturePad extends View {
+    private static final String TAG = "SignaturePad";
+
+    private static final String KEY_SIGNATURE_BITMAP_URL = "signatureBitmapUrl";
+    private static final String KEY_SIGNATURE_SVG = "signatureSvg";
+    private static final String TEMP_FILE_PREFIX = "signature-pad";
+    private static final String TEMP_FILE_EXT = ".png";
+
     //View state
     private List<TimedPoint> mPoints;
     private boolean mIsEmpty;
@@ -37,15 +51,16 @@ public class SignaturePad extends View {
     private float mLastTouchY;
     private float mLastVelocity;
     private float mLastWidth;
-    private RectF mDirtyRect;
     private Bitmap mBitmapSavedState;
+    //Dirty rectangle to update only the changed portion of the view
+    private final RectF mDirtyRect = new RectF();;
 
-    private final SvgBuilder mSvgBuilder = new SvgBuilder();
+    private SvgBuilder mSvgBuilder = new SvgBuilder();
 
     // Cache
-    private List<TimedPoint> mPointsCache = new ArrayList<>();
-    private ControlTimedPoints mControlTimedPointsCached = new ControlTimedPoints();
-    private Bezier mBezierCached = new Bezier();
+    private final List<TimedPoint> mPointsCache = new ArrayList<>();
+    private final ControlTimedPoints mControlTimedPointsCached = new ControlTimedPoints();
+    private final Bezier mBezierCached = new Bezier();
 
     //Configurable parameters
     private int mMinWidth;
@@ -55,18 +70,19 @@ public class SignaturePad extends View {
     private boolean mClearOnDoubleClick;
 
     //Double click detector
-    private GestureDetector mGestureDetector;
+    private final GestureDetector mGestureDetector;
 
     //Default attribute values
-    private final int DEFAULT_ATTR_PEN_MIN_WIDTH_PX = 3;
-    private final int DEFAULT_ATTR_PEN_MAX_WIDTH_PX = 7;
-    private final int DEFAULT_ATTR_PEN_COLOR = Color.BLACK;
-    private final float DEFAULT_ATTR_VELOCITY_FILTER_WEIGHT = 0.9f;
-    private final boolean DEFAULT_ATTR_CLEAR_ON_DOUBLE_CLICK = false;
+    private static final int DEFAULT_ATTR_PEN_MIN_WIDTH_PX = 3;
+    private static final int DEFAULT_ATTR_PEN_MAX_WIDTH_PX = 7;
+    private static final int DEFAULT_ATTR_PEN_COLOR = Color.BLACK;
+    private static final float DEFAULT_ATTR_VELOCITY_FILTER_WEIGHT = 0.9f;
+    private static final boolean DEFAULT_ATTR_CLEAR_ON_DOUBLE_CLICK = false;
 
-    private Paint mPaint = new Paint();
+    private final Paint mPaint = new Paint();
     private Bitmap mSignatureBitmap = null;
     private Canvas mSignatureBitmapCanvas = null;
+    private final String signatureStateFilePath;
 
     public SignaturePad(Context context, AttributeSet attrs) {
         super(context, attrs);
@@ -93,9 +109,6 @@ public class SignaturePad extends View {
         mPaint.setStrokeCap(Paint.Cap.ROUND);
         mPaint.setStrokeJoin(Paint.Join.ROUND);
 
-        //Dirty rectangle to update only the changed portion of the view
-        mDirtyRect = new RectF();
-
         clearView();
 
         mGestureDetector = new GestureDetector(context, new GestureDetector.SimpleOnGestureListener() {
@@ -104,6 +117,95 @@ public class SignaturePad extends View {
                 return onDoubleClick();
             }
         });
+
+        signatureStateFilePath = safeCreateTempFilePath();
+    }
+
+
+    /**
+     * Tries to create temp file and get its path. Exceptions suppressed.
+     *
+     * @return Returns absolute path or null.
+     */
+    private String safeCreateTempFilePath() {
+        String temporaryFilePath;
+
+        try {
+            temporaryFilePath = File.createTempFile(
+                    TEMP_FILE_PREFIX,
+                    TEMP_FILE_EXT,
+                    getContext().getFilesDir()
+            ).getAbsolutePath();
+        } catch (IOException exception) {
+            Log.e(TAG, "Failed to create temp file");
+            temporaryFilePath = null;
+        }
+
+        Log.d(TAG, String.format("Will use [%s] to store signature bitmap when needed", temporaryFilePath));
+
+        return temporaryFilePath;
+    }
+
+    private void updateBundleWithSignatureStateFilePath(Bundle bundle) {
+        if (signatureStateFilePath != null) {
+            bundle.putString(KEY_SIGNATURE_BITMAP_URL, signatureStateFilePath);
+            bundle.putParcelable(KEY_SIGNATURE_SVG, mSvgBuilder);
+        } else {
+            Log.e(TAG, "Skipped bundle update as no temp file to work with");
+        }
+    }
+
+    private void storeBitmapToSignatureStateFile() {
+        try {
+            Executors.newSingleThreadExecutor().submit(() -> {
+                Log.d(TAG, "Will save bitmap to path " + signatureStateFilePath);
+
+                if (signatureStateFilePath != null) {
+                    try (FileOutputStream fileOutputStream = new FileOutputStream(signatureStateFilePath)) {
+                        if (mBitmapSavedState.compress(Bitmap.CompressFormat.PNG, 100, fileOutputStream)) {
+                            Log.d(TAG, "Succeeded to compress bitmap to output stream");
+                        } else {
+                            Log.e(TAG, "Failed to compress bitmap to output stream");
+                        }
+                    } catch (FileNotFoundException fileNotFoundException) {
+                        Log.e(TAG, "Failed to write bitmap to output stream. File not found.");
+                    } catch (IOException ioException) {
+                        Log.e(TAG, "Failed to write bitmap to output stream. IO error.");
+                    }
+                } else {
+                    Log.e(TAG, "Skipped bitmap file save as no temp file to work with");
+                }
+            }).get();
+        } catch (Exception exception) {
+            Log.e(TAG, "Failed to wait for future completion with " + exception.getMessage());
+        }
+    }
+
+    private void readBitmapFromSignatureStateFile(Bundle bundle) {
+        String path = bundle.getString(KEY_SIGNATURE_BITMAP_URL);
+
+        if (path != null) {
+            Executors.newSingleThreadExecutor().submit(() -> {
+                Log.d(TAG, String.format("Will un-bundle bitmap from [%s]", path));
+
+                mBitmapSavedState = BitmapFactory.decodeFile(path);
+
+                if (mBitmapSavedState == null) {
+                    Log.d(TAG, "Failed to decode bitmap from path " + path);
+                } else {
+                    this.setSignatureBitmap(mBitmapSavedState);
+
+                    Log.d(TAG, String.format("Decoded bitmap is %d bytes", mBitmapSavedState.getByteCount()));
+                }
+                deleteTempFilePath(path);
+            });
+        }
+    }
+
+    private void deleteTempFilePath(String path) {
+        File file = new File(path);
+        Boolean deleted = file.delete();
+        Log.d(TAG, String.format("Was temp file delete successful? %b", deleted));
     }
 
     @Override
@@ -113,7 +215,8 @@ public class SignaturePad extends View {
         if (this.mHasEditState == null || this.mHasEditState) {
             this.mBitmapSavedState = this.getTransparentSignatureBitmap();
         }
-        bundle.putParcelable("signatureBitmap", this.mBitmapSavedState);
+        storeBitmapToSignatureStateFile();
+        updateBundleWithSignatureStateFilePath(bundle);
         return bundle;
     }
 
@@ -121,12 +224,27 @@ public class SignaturePad extends View {
     protected void onRestoreInstanceState(Parcelable state) {
         if (state instanceof Bundle) {
             Bundle bundle = (Bundle) state;
-            this.setSignatureBitmap((Bitmap) bundle.getParcelable("signatureBitmap"));
-            this.mBitmapSavedState = bundle.getParcelable("signatureBitmap");
+            readBitmapFromSignatureStateFile(bundle);
+            mSvgBuilder = bundle.getParcelable(KEY_SIGNATURE_SVG);
             state = bundle.getParcelable("superState");
         }
         this.mHasEditState = false;
         super.onRestoreInstanceState(state);
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        super.onDetachedFromWindow();
+        recycleBitmapSafely(mBitmapSavedState);
+        recycleBitmapSafely(mSignatureBitmap);
+        mBitmapSavedState = null;
+        mSignatureBitmap = null;
+    }
+
+    private void recycleBitmapSafely(Bitmap bitmap) {
+        if (bitmap != null && !bitmap.isRecycled()) {
+            bitmap.recycle();
+        }
     }
 
     /**
@@ -278,7 +396,9 @@ public class SignaturePad extends View {
         // View was laid out...
         if (ViewCompat.isLaidOut(this)) {
             clearView();
-            ensureSignatureBitmap();
+            if(signature == null) return;
+
+            if (!ensureSignatureBitmap()) return;
 
             RectF tempSrc = new RectF();
             RectF tempDst = new RectF();
@@ -485,8 +605,9 @@ public class SignaturePad extends View {
     }
 
     private void addBezier(Bezier curve, float startWidth, float endWidth) {
+        if (!ensureSignatureBitmap()) return;
+
         mSvgBuilder.append(curve, (startWidth + endWidth) / 2);
-        ensureSignatureBitmap();
         float originalWidth = mPaint.getStrokeWidth();
         float widthDelta = endWidth - startWidth;
         float drawSteps = (float) Math.ceil(curve.length());
@@ -596,12 +717,18 @@ public class SignaturePad extends View {
         }
     }
 
-    private void ensureSignatureBitmap() {
+    private boolean ensureSignatureBitmap() {
         if (mSignatureBitmap == null) {
-            mSignatureBitmap = Bitmap.createBitmap(getWidth(), getHeight(),
-                    Bitmap.Config.ARGB_8888);
+            int width = getWidth();
+            int height = getHeight();
+
+            // Abort logic if we don't have a size yet (due to Visibility or direct Sizing)
+            if (width == 0 || height == 0) return false;
+
+            mSignatureBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
             mSignatureBitmapCanvas = new Canvas(mSignatureBitmap);
         }
+        return true;
     }
 
     private int convertDpToPx(float dp) {
